@@ -1,66 +1,109 @@
-Tema realizata de: Vlad Părău
-Grupa: 322CC
+# Reliable Transport over UDP
+
+**Author:** Vlad Parau
+
+A reliable, connection-oriented transport protocol built on top of UDP in C++, modeled after TCP. It provides a three-way handshake, a sliding window sized from the Bandwidth-Delay Product (BDP), Selective Repeat ARQ for out-of-order delivery, and receiver-driven flow control. Multiple concurrent connections are handled with dedicated worker threads.
 
 ---
 
-### protocol.h
+## Project Structure
 
-S-au adaugat definitiile tipurilor de segmente folosite in protocol:
+```text
+.
+├── lib/
+│   ├── include/
+│   │   ├── lib.h         # Sender/Receiver class interfaces and per-connection state
+│   │   ├── protocol.h    # Segment types and the control-header layout
+│   │   └── utils.h       # Helper declarations
+│   ├── libcommon.cpp     # Shared logic used by both endpoints
+│   ├── librecv.cpp       # Receiver class implementation
+│   └── libsend.cpp       # Sender class implementation
+├── Makefile
+└── README.md
+```
 
-* TYPE_SYN (0x01) — primul pachet trimis de client pentru a initia o conexiune.
-* TYPE_SYN_ACK (0x02) — raspunsul serverului; contine in payload portul dedicat pe care clientul trebuie sa trimita datele.
-* TYPE_ACK (0x03) — confirmarea clientului care incheie handshake-ul three-way.
-* TYPE_DATA (0x04) — segmentele cu date utile trimise de sender la receiver.
-* TYPE_CTRL (0x05) — pachetele de ACK trimise de receiver inapoi la sender in timpul transferului.
-* SERVER_PORT (8032) — portul fix pe care serverul asculta cereri de conexiune.
-
-poli_tcp_synack — headerul de control urmat de data_port, reprezentand portul dedicat trimis de server in cadrul handshake-ului.
-
----
-
-### lib.h
-
-**Campuri adaugate pentru sender:**
-
-* max_window_seq — numarul maxim de segmente care pot fi trimise dar neconfirmate simultan; calculat pe baza BDP (Bandwidth-Delay Product).
-* recv_window_peer — fereastra de receptie anuntata de receiver in ultimul ACK primit; folosita pentru flow control.
-* send_base — numarul de secventa al celui mai vechi segment trimis neconfirmat; reprezinta inceputul ferestrei glisante.
-* next_seq — numarul de secventa al urmatorului segment de trimis.
-* send_buf — coada in care send_data pune bytes veniti de la aplicatie; sender_handler ii scade si ii impacheteaza in segmente.
-* window_segs — copii ale segmentelor trimise dar neconfirmate, indexate dupa numarul de secventa; folosite pentru retransmisie la timeout.
-
-**Campuri adaugate pentru receiver:**
-
-* expected_seq — urmatorul numar de secventa asteptat in ordine; tot ce vine inainte de aceasta valoare a fost deja livrat aplicatiei.
-* recv_buf — coada cu bytes receptionati in ordine, gata sa fie livrati prin recv_data.
-* recv_window — segmente sosite out-of-order, stocate temporar pana cand golul din secventa se umple (Selective Repeat).
-* data_ready — variabila de conditie pe care recv_data asteapta atunci cand recv_buf este gol; receiver_handler o semnalizeaza cand adauga date noi.
-
-### libsend.cpp — clasa Sender
-
-* **init_sender()** — salveaza parametrii legaturii si porneste thread-ul sender_handler.
-* **setup_connection()** — executa three-way handshake cu retry, calculeaza fereastra din BDP si inregistreaza conexiunea; returneaza conn_id.
-* **send_data()** — copiaza datele in send_buf sub mutex; nu trimite UDP direct.
-* **pump_window()** — scoate date din send_buf si trimite segmente cat timp fereastra permite; pastreaza copii in window_segs pentru retransmisie.
-* **sender_handler()** — asteapta ACK-uri si timeouturi; la timeout retransmite window_segs, la ACK avanseaza send_base; la fiecare iteratie apeleaza pump_window pentru toate conexiunile.
-
-### librecv.cpp — clasa Receiver
-
-* **init_receiver()** — creeaza socket-ul de listening pe portul 8032 si porneste thread-ul receiver_handler.
-* **wait4connect()** — executa three-way handshake pe server cu retry; foloseste MSG_PEEK pentru cazul in care ACK-ul se pierde; returneaza conn_id.
-* **recv_data()** — copiaza date din recv_buf in bufferul aplicatiei; se blocheaza pe pthread_cond_wait daca nu sunt date disponibile.
-* **receiver_handler()** — primeste segmente, le stocheaza in recv_window, le livreaza in ordine in recv_buf, semnalizeaza data_ready si trimite ACK.
+> This is the transport **library**: the sender and receiver logic that the test harness links against.
 
 ---
 
-## Protocolul dezvoltat
+## Protocol Overview
 
-Protocolul este un mecanism de transport fiabil peste UDP, similar cu TCP, construit din trei componente principale.
+The protocol is a reliable transport mechanism over UDP, similar to TCP, built from three main components.
 
-**Three-way handshake.** Inainte de a transfera date, clientul si serverul stabilesc o conexiune in trei pasi: clientul trimite SYN, serverul raspunde cu SYN-ACK (care contine si portul dedicat pe care va asculta datele), iar clientul confirma cu ACK. Dupa handshake, toata comunicarea de date are loc pe portul dedicat deschis de server, nu pe portul 8032. Ambele parti retransmit la 200ms.
+### Three-Way Handshake
+Before any data is transferred, the client and server establish a connection in three steps:
+1. The client sends **SYN**.
+2. The server replies with **SYN-ACK**, whose payload carries the **dedicated port** it will listen on for this connection's data.
+3. The client confirms with **ACK**.
 
-**Fereastra glisanta cu Selective Repeat ARQ.** Senderul poate trimite mai multe segmente fara a astepta confirmare pentru fiecare, pana la limita ferestrei. Fereastra este calculata din BDP (Bandwidth-Delay Product): latimea de banda inmultita cu RTT-ul, impartita la dimensiunea unui segment. La expirarea unui timer, retransmite toate segmentele neconfirmate din fereastra. Receiverele accepta segmente sosite out-of-order si le reordoneaza inainte de a le livra aplicatiei, trimitand ACK dupa fiecare segment primit.
+After the handshake, all data flows over the dedicated port opened by the server, **not** over the fixed listening port `8032`. Both sides retransmit unacknowledged handshake packets every **200 ms**.
 
-**Flow control.** Receiverele anunta in fiecare ACK cate segmente mai pot accepta (campul recv_window). Senderul nu depaseste aceasta valoare, evitand astfel depasirea capacitatii bufferului de receptie.
+### Sliding Window with Selective Repeat ARQ
+The sender may transmit multiple segments without waiting for an ACK on each, up to the window limit. The window is computed from the **Bandwidth-Delay Product**: `bandwidth × RTT / segment_size`. On a timer expiry, the sender retransmits all unacknowledged segments in the window. The receiver accepts **out-of-order** segments, buffers and reorders them before delivering to the application, and sends an ACK for every segment received.
 
-Numerele de secventa sunt pe 16 biti (0–65535) cu overflow controlat la % 65536.
+### Flow Control
+In each ACK, the receiver advertises how many more segments it can accept (`recv_window`). The sender never exceeds this value, which prevents overrunning the receiver's buffer.
+
+Sequence numbers are **16-bit (0–65535)** with controlled overflow via `% 65536`.
+
+---
+
+## Segment Types (`protocol.h`)
+
+| Type | Value | Purpose |
+|---|---|---|
+| `TYPE_SYN` | `0x01` | First packet from the client to initiate a connection |
+| `TYPE_SYN_ACK` | `0x02` | Server reply; payload carries the dedicated data port |
+| `TYPE_ACK` | `0x03` | Client confirmation that completes the three-way handshake |
+| `TYPE_DATA` | `0x04` | Data segments sent from sender to receiver |
+| `TYPE_CTRL` | `0x05` | ACK packets sent from receiver back to sender during transfer |
+| `SERVER_PORT` | `8032` | Fixed port on which the server listens for connection requests |
+
+`poli_tcp_synack` is the control header followed by `data_port` — the dedicated port the server sends during the handshake.
+
+---
+
+## Per-Connection State (`lib.h`)
+
+**Sender:**
+- `max_window_seq` — max number of in-flight unacknowledged segments; derived from the BDP.
+- `recv_window_peer` — receive window advertised by the receiver in the last ACK; used for flow control.
+- `send_base` — sequence number of the oldest unacknowledged segment; the start of the sliding window.
+- `next_seq` — sequence number of the next segment to send.
+- `send_buf` — queue where `send_data` places bytes from the application; `sender_handler` drains and packetizes them.
+- `window_segs` — copies of sent-but-unacknowledged segments, indexed by sequence number; used for retransmission on timeout.
+
+**Receiver:**
+- `expected_seq` — next in-order sequence number expected; everything before it has already been delivered.
+- `recv_buf` — queue of in-order bytes ready to be delivered via `recv_data`.
+- `recv_window` — out-of-order segments held temporarily until the sequence gap is filled (Selective Repeat).
+- `data_ready` — condition variable `recv_data` waits on when `recv_buf` is empty; signaled by `receiver_handler` when new data arrives.
+
+---
+
+## Key Functions
+
+### Sender (`libsend.cpp`)
+| Function | Description |
+|---|---|
+| `init_sender()` | Saves link parameters and starts the `sender_handler` thread |
+| `setup_connection()` | Runs the three-way handshake with retry, computes the window from BDP, registers the connection; returns `conn_id` |
+| `send_data()` | Copies data into `send_buf` under a mutex; does not send over UDP directly |
+| `pump_window()` | Drains `send_buf` and sends segments while the window allows; keeps copies in `window_segs` for retransmission |
+| `sender_handler()` | Waits for ACKs and timeouts; retransmits `window_segs` on timeout, advances `send_base` on ACK, calls `pump_window` each iteration for all connections |
+
+### Receiver (`librecv.cpp`)
+| Function | Description |
+|---|---|
+| `init_receiver()` | Creates the listening socket on port `8032` and starts the `receiver_handler` thread |
+| `wait4connect()` | Runs the server-side handshake with retry; uses `MSG_PEEK` to handle a lost final ACK; returns `conn_id` |
+| `recv_data()` | Copies data from `recv_buf` into the application buffer; blocks on `pthread_cond_wait` when no data is available |
+| `receiver_handler()` | Receives segments, stores them in `recv_window`, delivers them in order into `recv_buf`, signals `data_ready`, and sends ACKs |
+
+---
+
+## Notes
+
+- Concurrency is handled with POSIX threads: a dedicated handler thread per endpoint, with mutexes and condition variables guarding shared connection state.
+- The sender decouples the application-facing `send_data()` from the wire: data is buffered and the handler thread decides when to transmit based on window and flow-control limits.
+- Retransmission is timer-driven; unacknowledged segments are kept in `window_segs` until acknowledged.
